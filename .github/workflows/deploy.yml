@@ -1,0 +1,305 @@
+name: CI/CD Scaleway (prod + dev)
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+  workflow_dispatch:
+
+jobs:
+  ensure-dev-branch:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Create remote dev branch if missing
+        shell: bash
+        run: |
+          if git ls-remote --heads origin dev | grep -q dev; then
+            echo "dev branch already exists."
+            exit 0
+          fi
+          echo "Creating remote dev branch from current commit..."
+          git push origin HEAD:refs/heads/dev
+
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      SCW_ACCESS_KEY: ${{ secrets.SCW_ACCESS_KEY }}
+      SCW_SECRET_KEY: ${{ secrets.SCW_SECRET_KEY }}
+      SCW_DEFAULT_PROJECT_ID: ${{ secrets.SCW_DEFAULT_PROJECT_ID }}
+      SCW_DEFAULT_ORGANIZATION_ID: ${{ secrets.SCW_DEFAULT_ORGANIZATION_ID }}
+      SCW_REGION: ${{ secrets.SCW_REGION }}
+      REGISTRY_NAMESPACE: ${{ secrets.SCW_REGISTRY_NAMESPACE }}
+      CONTAINER_NAMESPACE_ID: ${{ secrets.SCW_CONTAINER_NAMESPACE_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set environment (prod/dev)
+        id: env
+        shell: bash
+        run: |
+          BRANCH_NAME="${GITHUB_REF#refs/heads/}"
+          if [ "$BRANCH_NAME" = "main" ]; then
+            echo "ENVIRONMENT=prod" >> $GITHUB_ENV
+            echo "CONTAINER_NAME=${{ secrets.PROD_CONTAINER_NAME }}" >> $GITHUB_ENV
+            echo "DATABASE_INSTANCE_NAME=${{ secrets.PROD_DATABASE_INSTANCE_NAME }}" >> $GITHUB_ENV
+            echo "DATABASE_ENGINE=${{ secrets.PROD_DATABASE_ENGINE }}" >> $GITHUB_ENV
+            echo "DATABASE_VERSION=${{ secrets.PROD_DATABASE_VERSION }}" >> $GITHUB_ENV
+            echo "DATABASE_NODE_TYPE=${{ secrets.PROD_DATABASE_NODE_TYPE }}" >> $GITHUB_ENV
+            echo "DATABASE_VOLUME_SIZE=${{ secrets.PROD_DATABASE_VOLUME_SIZE }}" >> $GITHUB_ENV
+            echo "DATABASE_USER=${{ secrets.PROD_DATABASE_USER }}" >> $GITHUB_ENV
+            echo "DATABASE_PASSWORD=${{ secrets.PROD_DATABASE_PASSWORD }}" >> $GITHUB_ENV
+            echo "DATABASE_NAME=${{ secrets.PROD_DATABASE_NAME }}" >> $GITHUB_ENV
+            echo "DATABASE_URL=${{ secrets.PROD_DATABASE_URL }}" >> $GITHUB_ENV
+            echo "DOMAIN=${{ secrets.PROD_DOMAIN }}" >> $GITHUB_ENV
+            echo "MIN_SCALE=${{ secrets.PROD_MIN_SCALE }}" >> $GITHUB_ENV
+            echo "MAX_SCALE=${{ secrets.PROD_MAX_SCALE }}" >> $GITHUB_ENV
+            echo "SERVICE_PORT=${{ secrets.PROD_SERVICE_PORT }}" >> $GITHUB_ENV
+          else
+            echo "ENVIRONMENT=dev" >> $GITHUB_ENV
+            echo "CONTAINER_NAME=${{ secrets.DEV_CONTAINER_NAME }}" >> $GITHUB_ENV
+            echo "DATABASE_INSTANCE_NAME=${{ secrets.DEV_DATABASE_INSTANCE_NAME }}" >> $GITHUB_ENV
+            echo "DATABASE_ENGINE=${{ secrets.DEV_DATABASE_ENGINE }}" >> $GITHUB_ENV
+            echo "DATABASE_VERSION=${{ secrets.DEV_DATABASE_VERSION }}" >> $GITHUB_ENV
+            echo "DATABASE_NODE_TYPE=${{ secrets.DEV_DATABASE_NODE_TYPE }}" >> $GITHUB_ENV
+            echo "DATABASE_VOLUME_SIZE=${{ secrets.DEV_DATABASE_VOLUME_SIZE }}" >> $GITHUB_ENV
+            echo "DATABASE_USER=${{ secrets.DEV_DATABASE_USER }}" >> $GITHUB_ENV
+            echo "DATABASE_PASSWORD=${{ secrets.DEV_DATABASE_PASSWORD }}" >> $GITHUB_ENV
+            echo "DATABASE_NAME=${{ secrets.DEV_DATABASE_NAME }}" >> $GITHUB_ENV
+            echo "DATABASE_URL=${{ secrets.DEV_DATABASE_URL }}" >> $GITHUB_ENV
+            echo "DOMAIN=${{ secrets.DEV_DOMAIN }}" >> $GITHUB_ENV
+            echo "MIN_SCALE=${{ secrets.DEV_MIN_SCALE }}" >> $GITHUB_ENV
+            echo "MAX_SCALE=${{ secrets.DEV_MAX_SCALE }}" >> $GITHUB_ENV
+            echo "SERVICE_PORT=${{ secrets.DEV_SERVICE_PORT }}" >> $GITHUB_ENV
+          fi
+          if [ -z "${SCW_REGION}" ]; then
+            REGION_VALUE="fr-par"
+          else
+            REGION_VALUE="${SCW_REGION}"
+          fi
+          echo "SCW_DEFAULT_REGION=${REGION_VALUE}" >> $GITHUB_ENV
+          echo "REGISTRY_HOST=rg.${REGION_VALUE}.scw.cloud" >> $GITHUB_ENV
+          echo "IMAGE_REPO=${REGISTRY_NAMESPACE}/synkit" >> $GITHUB_ENV
+          echo "IMAGE_TAG=${GITHUB_SHA}-${ENVIRONMENT}" >> $GITHUB_ENV
+
+      - name: Mask sensitive values
+        shell: bash
+        run: |
+          echo "::add-mask::${{ secrets.SCW_SECRET_KEY }}"
+          echo "::add-mask::${{ secrets.PROD_DATABASE_PASSWORD }}"
+          echo "::add-mask::${{ secrets.DEV_DATABASE_PASSWORD }}"
+          echo "::add-mask::${{ secrets.PROD_DATABASE_URL }}"
+          echo "::add-mask::${{ secrets.DEV_DATABASE_URL }}"
+
+      - name: Install jq and curl
+        run: sudo apt-get update && sudo apt-get install -y jq curl
+
+      - name: Install Scaleway CLI
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/scaleway/scaleway-cli/master/scripts/get.sh | sudo sh -s -- -b /usr/local/bin
+          scw version
+
+      - name: Docker login to Scaleway Registry
+        env:
+          DOCKER_PASSWORD: ${{ secrets.SCW_SECRET_KEY }}
+        run: |
+          echo "$DOCKER_PASSWORD" | docker login ${REGISTRY_HOST} -u nologin --password-stdin
+
+      - name: Build and push image
+        run: |
+          IMAGE_PATH="${REGISTRY_HOST}/${IMAGE_REPO}:${IMAGE_TAG}"
+          echo "IMAGE_PATH=${IMAGE_PATH}" >> $GITHUB_ENV
+          docker build -t "$IMAGE_PATH" .
+          docker push "$IMAGE_PATH"
+
+      - name: Ensure managed database (Scaleway RDB)
+        shell: bash
+        env:
+          DATABASE_INSTANCE_NAME: ${{ env.DATABASE_INSTANCE_NAME }}
+          DATABASE_ENGINE: ${{ env.DATABASE_ENGINE }}
+          DATABASE_VERSION: ${{ env.DATABASE_VERSION }}
+          DATABASE_NODE_TYPE: ${{ env.DATABASE_NODE_TYPE }}
+          DATABASE_VOLUME_SIZE: ${{ env.DATABASE_VOLUME_SIZE }}
+          DATABASE_USER: ${{ env.DATABASE_USER }}
+          DATABASE_PASSWORD: ${{ env.DATABASE_PASSWORD }}
+          DATABASE_NAME: ${{ env.DATABASE_NAME }}
+          SCW_DEFAULT_REGION: ${{ env.SCW_DEFAULT_REGION }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DATABASE_INSTANCE_NAME}" ]; then
+            echo "DATABASE_INSTANCE_NAME is not set; skipping database provisioning."
+            exit 0
+          fi
+
+          if [ -z "${DATABASE_PASSWORD}" ]; then
+            echo "DATABASE_PASSWORD must be provided via secrets."
+            exit 1
+          fi
+
+          echo "::add-mask::${DATABASE_PASSWORD}"
+
+          DB_INSTANCE_ID=$(scw rdb instance list name="${DATABASE_INSTANCE_NAME}" -o json | jq -r '.[0].id // empty')
+
+          if [ -z "$DB_INSTANCE_ID" ]; then
+            echo "Creating RDB instance ${DATABASE_INSTANCE_NAME}..."
+            DB_INSTANCE_ID=$(scw rdb instance create \
+              name="${DATABASE_INSTANCE_NAME}" \
+              project-id="${SCW_DEFAULT_PROJECT_ID}" \
+              organization-id="${SCW_DEFAULT_ORGANIZATION_ID}" \
+              engine="${DATABASE_ENGINE}" \
+              version="${DATABASE_VERSION}" \
+              user-name="${DATABASE_USER}" \
+              password="${DATABASE_PASSWORD}" \
+              node-type="${DATABASE_NODE_TYPE}" \
+              volume-size="${DATABASE_VOLUME_SIZE}" \
+              is-ha=false \
+              -o json | jq -r '.id')
+          else
+            echo "Reusing RDB instance ${DATABASE_INSTANCE_NAME} (ID: ${DB_INSTANCE_ID})."
+          fi
+
+          echo "Waiting for database instance to become ready..."
+          for attempt in {1..30}; do
+            STATUS=$(scw rdb instance get instance-id="$DB_INSTANCE_ID" -o json | jq -r '.status')
+            echo "Instance status: $STATUS"
+            if [ "$STATUS" = "ready" ]; then
+              break
+            fi
+            sleep 10
+          done
+
+          DB_ENDPOINT_JSON=$(scw rdb endpoint list instance-id="$DB_INSTANCE_ID" -o json | jq '.[0]')
+          DB_HOST=$(echo "$DB_ENDPOINT_JSON" | jq -r '.hostname // .ip // empty')
+          DB_PORT=$(echo "$DB_ENDPOINT_JSON" | jq -r '.port // empty')
+
+          if [ -z "$DB_HOST" ] || [ -z "$DB_PORT" ]; then
+            echo "Unable to detect database endpoint."
+            exit 1
+          fi
+
+          if ! scw rdb database list instance-id="$DB_INSTANCE_ID" -o json | jq -e --arg name "$DATABASE_NAME" 'map(select(.name==$name)) | length > 0' >/dev/null; then
+            echo "Creating database ${DATABASE_NAME}..."
+            scw rdb database create instance-id="$DB_INSTANCE_ID" name="$DATABASE_NAME"
+          else
+            echo "Database ${DATABASE_NAME} already exists."
+          fi
+
+          if ! scw rdb user list instance-id="$DB_INSTANCE_ID" -o json | jq -e --arg name "$DATABASE_USER" 'map(select(.name==$name)) | length > 0' >/dev/null; then
+            echo "Creating database user ${DATABASE_USER}..."
+            scw rdb user create instance-id="$DB_INSTANCE_ID" name="$DATABASE_USER" password="$DATABASE_PASSWORD" is-admin=true
+          else
+            echo "Updating password for user ${DATABASE_USER}."
+            scw rdb user update instance-id="$DB_INSTANCE_ID" name="$DATABASE_USER" password="$DATABASE_PASSWORD" >/dev/null 2>&1 || true
+          fi
+
+          scw rdb privilege set instance-id="$DB_INSTANCE_ID" database-name="$DATABASE_NAME" user-name="$DATABASE_USER" permission=all >/dev/null 2>&1 || true
+
+          DATABASE_URL="postgresql://${DATABASE_USER}:${DATABASE_PASSWORD}@${DB_HOST}:${DB_PORT}/${DATABASE_NAME}"
+          echo "::add-mask::${DATABASE_URL}"
+          echo "DATABASE_URL=${DATABASE_URL}" >> $GITHUB_ENV
+          echo "DATABASE_INSTANCE_ID=${DB_INSTANCE_ID}" >> $GITHUB_ENV
+
+      - name: Setup Node for build-time tooling (optional)
+        if: ${{ hashFiles('package.json') != '' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install build dependencies
+        if: ${{ hashFiles('package.json') != '' }}
+        run: npm ci --ignore-scripts
+
+      - name: Create or update Serverless Container
+        env:
+          DATABASE_URL: ${{ env.DATABASE_URL }}
+          SCW_ACCESS_KEY: ${{ env.SCW_ACCESS_KEY }}
+          SCW_SECRET_KEY: ${{ env.SCW_SECRET_KEY }}
+          SCW_DEFAULT_PROJECT_ID: ${{ env.SCW_DEFAULT_PROJECT_ID }}
+          SCW_DEFAULT_ORGANIZATION_ID: ${{ env.SCW_DEFAULT_ORGANIZATION_ID }}
+          SCW_DEFAULT_REGION: ${{ env.SCW_DEFAULT_REGION }}
+          DOMAIN: ${{ env.DOMAIN }}
+          CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
+          MIN_SCALE: ${{ env.MIN_SCALE }}
+          MAX_SCALE: ${{ env.MAX_SCALE }}
+          SERVICE_PORT: ${{ env.SERVICE_PORT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${CONTAINER_NAME}" ]; then
+            echo "CONTAINER_NAME is required."
+            exit 1
+          fi
+          if [ -z "${SERVICE_PORT}" ]; then
+            SERVICE_PORT=3000
+          fi
+          if [ -z "${MIN_SCALE}" ]; then
+            MIN_SCALE=0
+          fi
+          if [ -z "${MAX_SCALE}" ]; then
+            MAX_SCALE=1
+          fi
+          CONTAINER_ID=$(scw container container list name="$CONTAINER_NAME" -o json | jq -r '.[0].id // empty')
+          if [ -z "$CONTAINER_ID" ]; then
+            echo "Creating container $CONTAINER_NAME in namespace $CONTAINER_NAMESPACE_ID"
+            CONTAINER_ID=$(scw container container create \
+              name="$CONTAINER_NAME" \
+              namespace-id="$CONTAINER_NAMESPACE_ID" \
+              registry-image="$IMAGE_PATH" \
+              protocol=http \
+              port="$SERVICE_PORT" \
+              min-scale="$MIN_SCALE" \
+              max-scale="$MAX_SCALE" \
+              environment-variables.DATABASE_URL="$DATABASE_URL" \
+              environment-variables.NODE_ENV="$ENVIRONMENT" \
+              environment-variables.PUBLIC_BASE_URL="https://${DOMAIN}" \
+              -o json | jq -r '.id')
+          else
+            echo "Updating container $CONTAINER_NAME ($CONTAINER_ID)"
+            scw container container update \
+              container-id="$CONTAINER_ID" \
+              registry-image="$IMAGE_PATH" \
+              min-scale="$MIN_SCALE" \
+              max-scale="$MAX_SCALE" \
+              environment-variables.DATABASE_URL="$DATABASE_URL" \
+              environment-variables.NODE_ENV="$ENVIRONMENT" \
+              environment-variables.PUBLIC_BASE_URL="https://${DOMAIN}"
+          fi
+          echo "Container ID: $CONTAINER_ID"
+          echo "CONTAINER_ID=$CONTAINER_ID" >> $GITHUB_ENV
+
+      - name: Attach domain to container (optional)
+        if: ${{ env.DOMAIN != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${CONTAINER_ID:-}" ]; then
+            echo "Missing container ID; skip domain attachment."
+            exit 0
+          fi
+          EXISTING=$(scw container domain list container-id="$CONTAINER_ID" -o json | jq -r --arg domain "$DOMAIN" 'map(select(.hostname==$domain)) | length > 0')
+          if [ "$EXISTING" = "true" ]; then
+            echo "Domain ${DOMAIN} already attached."
+          else
+            echo "Attaching domain ${DOMAIN} to container ${CONTAINER_ID}" 
+            scw container domain attach container-id="$CONTAINER_ID" hostname="$DOMAIN"
+          fi
+
+      - name: Output deployment summary
+        shell: bash
+        run: |
+          echo "Environment: ${ENVIRONMENT}"
+          echo "Container: ${CONTAINER_NAME}"
+          echo "Image: ${IMAGE_PATH}"
+          echo "Domain: ${DOMAIN}"
+          echo "Database instance ID: ${DATABASE_INSTANCE_ID:-not managed automatically}"
