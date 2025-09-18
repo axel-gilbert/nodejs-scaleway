@@ -1,5 +1,17 @@
 # Node.js + Scaleway (minimal)
 
+```mermaid
+flowchart TD
+  A[Developer Push] -->|branch dev| B[GitHub Actions];
+  A -->|branch main| B;
+  B --> C[Build Docker Image];
+  C --> D[Push to Scaleway Container Registry];
+  D -->|tag dev| E[Deploy to Serverless Container - DEV];
+  D -->|tag prod| F[Deploy to Serverless Container - PROD];
+  E --> G[Dev Endpoint];
+  F --> H[Prod Endpoint];
+```
+
 Minimal sample that builds a Node.js “Hello World” container and pushes it to Scaleway Container Registry via GitHub Actions. You can then point one or more Serverless Containers at the pushed image tags.
 
 ## What’s included
@@ -46,19 +58,5 @@ You can let the workflow create/update them automatically via `scw serverless co
 ## Run locally
 
 - `npm start` → http://localhost:3000 returns “Hello World”.
-
-## Diagram
-
-```mermaid
-flowchart TD
-  A[Developer Push] -->|branch dev| B[GitHub Actions];
-  A -->|branch main| B;
-  B --> C[Build Docker Image];
-  C --> D[Push to Scaleway Container Registry];
-  D -->|tag dev| E[Deploy to Serverless Container - DEV];
-  D -->|tag prod| F[Deploy to Serverless Container - PROD];
-  E --> G[Dev Endpoint];
-  F --> H[Prod Endpoint];
-```
 
 That’s it — simple app, simple pipeline with two environments. Adjust names and scaling as you grow.
