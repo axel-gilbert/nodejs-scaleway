@@ -1,0 +1,14 @@
+{
+  "name": "scaleway-hello",
+  "version": "1.0.0",
+  "description": "Minimal Node.js Hello World for Scaleway Serverless Containers sample",
+  "main": "server.js",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
+
